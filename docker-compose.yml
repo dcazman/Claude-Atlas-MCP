@@ -1,0 +1,12 @@
+services:
+  atlas-mcp:
+    build: .
+    image: atlas-mcp:local
+    container_name: atlas-mcp
+    restart: unless-stopped
+    ports:
+      - "7784:7784"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
