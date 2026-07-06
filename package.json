@@ -1,0 +1,20 @@
+{
+  "name": "atlas-mcp",
+  "version": "1.0.0",
+  "description": "Self-hosted MCP server that gives Claude persistent memory across conversations - entities, observations, history, and time-based reminders, in a lightweight Node/SQLite backend you run yourself.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dcazman/Claude-Atlas-MCP.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "zod": "^4.4.3"
+  }
+}
