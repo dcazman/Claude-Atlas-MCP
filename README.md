@@ -116,6 +116,10 @@ Set via `.env` (see `.env.example`):
 | `PORT` | Listen port (defaults to `7784`). |
 | `ATLAS_DB_PATH` | Path to the SQLite file (defaults to `../data/atlas.db` relative to `src/`; the Docker image uses `/app/data/atlas.db`). |
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the threat model, deployment hardening notes, and how to report a vulnerability.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
