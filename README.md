@@ -13,17 +13,17 @@ Claude forgets everything when a conversation ends. Atlas is a small, boring, du
 | Concept | What it is |
 |---------|-----------|
 | **Entity** | A topic or project you want Claude to track (e.g. "Home Network", "Q3 Planning"). Has a name and a one-line summary. |
-| **Observation** | A single fact attached to an entity ("switched the router to the 6E band on 2026-06-01"). The atomic unit of memory. |
+| **Observation** | A single fact attached to an entity ("switched the router to the 6E band on 2026-06-01"). The atomic unit of memory. Can be edited in place or marked protected against accidental deletion. |
 | **History event** | A notable thing that happened, logged to the timeline for later recall. |
 | **Reminder** | A note with a `trigger_date`. Once the date arrives it auto-surfaces at the start of a conversation and stays until dismissed. |
-| **Section** | A top-level namespace — one of two fixed values, `work` and `personal`. Every tool call takes a `section` argument, so the two contexts never bleed into each other. |
+| **Section** | A top-level namespace — one of three fixed values, `work`, `personal`, and `shared`. Every tool call takes a `section` argument. `shared` is a handoff channel both `work`- and `personal`-scoped tokens can read/write; `get_landscape` automatically merges it into whichever section you pull. |
 
 ## Tools
 
-The server exposes 13 MCP tools:
+The server exposes 16 MCP tools:
 
 **Reading**
-- `get_landscape` — everything in a section: all entities with their observations, plus any due reminders. Call at the start of a conversation to get oriented.
+- `get_landscape` — everything in a section (with `shared` auto-merged in): all entities with their observations, plus any due reminders. Call at the start of a conversation to get oriented.
 - `search` — keyword search across entities, observations, and history.
 - `get_entity` — one entity and its observations by name.
 - `get_history` — the timeline of logged events.
@@ -31,8 +31,10 @@ The server exposes 13 MCP tools:
 **Writing**
 - `upsert_entity` — create or update an entity's name/summary.
 - `add_observation` — attach a fact to an entity.
-- `remove_observation` — drop a fact that's stale or done.
-- `remove_entity` — delete an entity and its observations.
+- `update_observation` — edit a fact in place; the ID and its history stay stable. Works on protected rows.
+- `remove_observation` — drop a fact that's stale or done (refuses if protected).
+- `protect_observation` / `unprotect_observation` — mark a fact as protected from deletion, or lift that protection.
+- `remove_entity` — delete an entity and its observations (refuses if any observation is protected).
 - `log_event` — record a notable event to history.
 
 **Reminders**
@@ -40,6 +42,24 @@ The server exposes 13 MCP tools:
 - `list_reminders` — all reminders, or just those currently due.
 - `dismiss_reminder` — mark a reminder handled (it stops surfacing).
 - `remove_reminder` — delete a reminder outright.
+
+Every tool response also carries a small time footer — current server time
+(America/New_York) plus elapsed time since that token's last call — so the
+model never has to guess or do date math from a stale mental clock.
+
+## Groom worker
+
+`src/groom.js` is a standalone script meant to run on a schedule (cron, or
+`docker exec <container> node src/groom.js`). It's intentionally report-only
+and mechanical — no LLM calls, no deletion of your data:
+
+- flags likely near-duplicate observations within an entity
+- flags dormant entities (60+ days untouched) as archive/compress candidates
+- flags long-dismissed reminders (90+ days) as removal candidates
+- rotates its own `audit_log` (90+ days) — the only thing it actually deletes
+- skips entities untouched since the last run, so repeat runs are cheap
+
+Findings land in a per-section "Groom Report" entity for you (or Claude) to act on.
 
 ## Requirements
 
@@ -79,7 +99,7 @@ https://<your-host>/atlas-mcp?token=<your-secret>
 
 The token is the **secret** half of an `ATLAS_TOKEN` `caller:secret` pair (see below). You can also pass it as an `X-Atlas-Token` header or a `Bearer` token instead of the query string.
 
-There's no `section` in the URL — every tool takes a `section` argument (`work` or `personal`), and which one a given conversation should default to is best set in your Claude project's custom instructions (e.g. *"Your Atlas section is personal"*). A `GET /health` endpoint is available for liveness checks.
+There's no `section` in the URL — every tool takes a `section` argument (`work`, `personal`, or `shared`), and which one a given conversation should default to is best set in your Claude project's custom instructions (e.g. *"Your Atlas section is personal"*). A `GET /health` endpoint is available for liveness checks.
 
 For real use you'll want it behind HTTPS — a reverse proxy or a tunnel (Cloudflare Tunnel, Tailscale, nginx, etc.) in front of the container. The token is the only auth, so **do not expose the port publicly without TLS.**
 
@@ -112,7 +132,7 @@ Set via `.env` (see `.env.example`):
 
 | Variable | Purpose |
 |----------|---------|
-| `ATLAS_TOKEN` | **Required.** One or more `caller:secret` pairs, comma-separated (e.g. `claude:changeme`). A request is authorized if its token matches any secret. Generate one with `node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"`. |
+| `ATLAS_TOKEN` | **Required.** One or more `caller:secret:scope` triples, comma-separated. Scope is mandatory — `work` (reaches `work`+`shared`), `personal` (reaches `personal`+`shared`), or `shared` (reaches `shared` only). Enforced server-side on every call; out-of-scope requests get a 403 and are logged. Generate a secret with `node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"`. |
 | `PORT` | Listen port (defaults to `7784`). |
 | `ATLAS_DB_PATH` | Path to the SQLite file (defaults to `../data/atlas.db` relative to `src/`; the Docker image uses `/app/data/atlas.db`). |
 
