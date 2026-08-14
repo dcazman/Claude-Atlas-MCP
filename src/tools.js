@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const db = require('./db');
+const tz = require('./tz');
 
 const SECTION = z.enum(['work', 'personal', 'shared']).describe(
   'Which section of Atlas to operate on. Your token reaches its own section plus "shared"; anything else is refused server-side (403).'
@@ -25,15 +26,6 @@ function denied(auth, section) {
 // since the token's last call. Push-based clock — the client model never has
 // to remember to ask what time it is.
 // ---------------------------------------------------------------------------
-function fmtEastern(d) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short',
-  }).formatToParts(d).reduce((o, p) => (o[p.type] = p.value, o), {});
-  return `${parts.weekday} ${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${parts.timeZoneName}`;
-}
-
 function fmtElapsed(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
   if (s < 60) return `${s}s`;
@@ -47,7 +39,7 @@ function fmtElapsed(ms) {
 
 function timeLine(caller, prevTs) {
   const now = new Date();
-  let line = `server_time: ${fmtEastern(now)}`;
+  let line = `server_time: ${tz.format(now)}`;
   if (prevTs) {
     const prev = new Date(prevTs.replace(' ', 'T') + 'Z');
     line += ` | since your last Atlas call: ${fmtElapsed(now - prev)}`;
@@ -87,7 +79,10 @@ function registerTools(server, auth) {
     if (args.entity) parts.push(`entity=${args.entity}`);
     if (args.name) parts.push(`name=${args.name}`);
     if (args.observation_id !== undefined) parts.push(`obs=${args.observation_id}`);
+    if (Array.isArray(args.ids)) parts.push(`ids=${args.ids.join(',')}`);
     if (args.reminder_id !== undefined) parts.push(`rem=${args.reminder_id}`);
+    if (args.pending_id !== undefined) parts.push(`tray=${args.pending_id}`);
+    if (args.research_id !== undefined) parts.push(`shelf=${args.research_id}`);
     if (args.query) parts.push(`q=${args.query}`);
     return parts.join(' ') || null;
   }
@@ -97,7 +92,7 @@ function registerTools(server, auth) {
   server.registerTool('get_time', {
     title: 'Get time',
     description:
-      'Get the current date and time (America/New_York) plus elapsed time since your last Atlas call. ' +
+      `Get the current date and time (${tz.TZ}) plus elapsed time since your last Atlas call. ` +
       'Very cheap. Call this on any turn involving dates, scheduling, or elapsed time when you have not ' +
       'already touched Atlas this turn — never do date math from memory.',
     inputSchema: {},
@@ -134,6 +129,25 @@ function registerTools(server, auth) {
     const entity = db.getEntity(section, name);
     if (!entity) return text(`No entity named "${name}" in ${section}.`);
     return json(entity);
+  });
+
+  // get_observation is registered directly rather than through guarded(): it
+  // takes no section, because scope is resolved from each row's OWN section.
+  server.registerTool('get_observation', {
+    title: 'Get observation by id',
+    description:
+      'Fetch 1-20 observations directly by their id. Observation ids are stable and never reused, ' +
+      'which makes them the cheapest way to hand specific facts from one conversation to the next: ' +
+      'cite the ids in a handoff, then fetch exactly those instead of re-reading a whole entity. ' +
+      'Ids you cannot reach - out of scope, deleted, or never issued - come back in "missing", ' +
+      'with no way to tell those cases apart.',
+    inputSchema: {
+      ids: z.array(z.number().int()).min(1).max(20).describe('Observation ids to fetch, e.g. [412, 87].'),
+    },
+  }, async ({ ids }) => {
+    const prev = db.lastCallTime(auth.caller);
+    db.audit(auth.caller, 'get_observation', null, true, `ids=${ids.join(',')}`);
+    return withFooter(json(db.getObservationsByIds(auth.sections, ids)), auth.caller, prev);
   });
 
   guarded('upsert_entity', {
@@ -291,15 +305,51 @@ function registerTools(server, auth) {
       'Create a time-based reminder that will automatically appear in get_landscape output ' +
       'on or after its trigger date - no need for the user to bring it up again. ' +
       'Use for things like cert/license expirations, "start flagging X on date Y", or anything ' +
-      'with a known future date it should resurface on.',
+      'with a known future date it should resurface on. ' +
+      'Add trigger_time to make it a TIMED reminder: it becomes due at that clock time and is ' +
+      'meant to be delivered once by whatever polls list_due_reminders (a notifier, a cron job, ' +
+      'a chat bot). Without trigger_time the reminder is passive - it waits in the landscape ' +
+      'until it is dismissed.',
     inputSchema: {
       section: SECTION,
       content: z.string().describe('The reminder text, written plainly, e.g. "TLS cert expires September 2026 - action needed."'),
       trigger_date: z.string().describe('Date (YYYY-MM-DD) on or after which this reminder should start appearing in get_landscape.'),
+      trigger_time: z.string().regex(/^([01]?\d|2[0-3]):[0-5]\d$/, 'trigger_time must be HH:MM (24h)').optional()
+        .describe(`Optional HH:MM (24h), read in ${tz.TZ}. Makes this a timed reminder that is delivered once at that moment.`),
       entity: z.string().optional().describe('Optional entity/topic name to link this reminder to.'),
     },
-  }, async ({ section, content, trigger_date, entity }) => {
-    return json(db.createReminder(section, content, trigger_date, entity));
+  }, async ({ section, content, trigger_date, trigger_time, entity }) => {
+    return json(db.createReminder(section, content, trigger_date, entity, trigger_time));
+  });
+
+  guarded('list_due_reminders', {
+    title: 'List due reminders',
+    description:
+      'Everything currently due and not dismissed: passive reminders whose date has arrived ' +
+      '(due until dismissed) plus timed reminders whose date and time have arrived and that have ' +
+      'not been delivered yet. This is the endpoint an external notifier polls - it should deliver ' +
+      'only the rows that carry a trigger_time, then call mark_reminder_fired on each so it lands once.',
+    inputSchema: { section: SECTION },
+  }, async ({ section }) => {
+    return json(db.getDueReminders(section));
+  });
+
+  guarded('mark_reminder_fired', {
+    title: 'Mark reminder fired',
+    description:
+      'Stamp a TIMED reminder as delivered so it never fires again. Call this right after actually ' +
+      'delivering it. Passive reminders (no trigger_time) have no firing step - they stay due until ' +
+      'dismissed, so use dismiss_reminder for those. Returns false if it was already stamped, which ' +
+      'makes overlapping pollers safe.',
+    inputSchema: {
+      section: SECTION,
+      reminder_id: z.number().int().describe('The id of the timed reminder that was just delivered.'),
+    },
+  }, async ({ section, reminder_id }) => {
+    const ok = db.markReminderFired(section, reminder_id);
+    return text(ok
+      ? `Reminder ${reminder_id} stamped as fired.`
+      : `Reminder ${reminder_id} was already fired, or does not exist in ${section}.`);
   });
 
   guarded('list_reminders', {
@@ -342,6 +392,164 @@ function registerTools(server, auth) {
   }, async ({ section, reminder_id }) => {
     const ok = db.removeReminder(section, reminder_id);
     return text(ok ? `Removed reminder ${reminder_id}.` : `No reminder ${reminder_id} found in ${section}.`);
+  });
+
+  // -------------------------------------------------------------------------
+  // THE TRAY - capture now, decide later.
+  // -------------------------------------------------------------------------
+
+  guarded('pending_add', {
+    title: 'Add to tray',
+    description:
+      'Drop something into the tray: a message, a request, a half-finished thought, anything that ' +
+      'arrived and needs triage but should not interrupt what is happening now. Capturing is cheap ' +
+      'and reversible - when in doubt, put it in the tray rather than deciding on the spot.',
+    inputSchema: {
+      section: SECTION,
+      summary: z.string().describe('One line describing what arrived, in plain language.'),
+      source: z.string().optional().describe('Where it came from, your own vocabulary, e.g. "email", "meeting", "shower thought" (default "manual").'),
+      source_ref: z.string().optional().describe('Optional pointer back to the original: a URL, a message id, a file path.'),
+      source_date: z.string().optional().describe('Optional date the item originally arrived (YYYY-MM-DD).'),
+    },
+  }, async ({ section, summary, source, source_ref, source_date }) => {
+    return json(db.addPendingItem(section, summary, { source, source_ref, source_date }));
+  });
+
+  guarded('pending_list', {
+    title: 'List tray',
+    description:
+      'List untriaged tray items, oldest first, with a "pos" field - the position is the number to ' +
+      'speak in conversation ("tray 3"), so it stays readable as ids grow. Resolved items are hidden; ' +
+      'the tray shows only what still needs a decision.',
+    inputSchema: { section: SECTION },
+  }, async ({ section }) => {
+    const items = db.listPending(section).map((item, i) => ({ pos: i + 1, ...item }));
+    return json(items);
+  });
+
+  guarded('pending_promote', {
+    title: 'Promote tray item to memory',
+    description:
+      'Turn a tray item into a durable observation on an entity - the capture stops being noise and ' +
+      'becomes something Claude will read back in future conversations. The tray row records which ' +
+      'observation it became.',
+    inputSchema: {
+      section: SECTION,
+      pending_id: z.number().int().describe('The id of the tray item to promote.'),
+      entity: z.string().describe('Entity/topic the resulting observation belongs to (created if new).'),
+      content: z.string().optional().describe('Optional rewritten text for the observation. Defaults to the tray item summary - rewrite it if the raw capture would not read well in six months.'),
+    },
+  }, async ({ section, pending_id, entity, content }) => {
+    return json(db.promotePending(section, pending_id, entity, content));
+  });
+
+  guarded('pending_merge', {
+    title: 'Merge tray item',
+    description:
+      'Fold a duplicate tray item into the one you are keeping. The merged item stops showing up but ' +
+      'is not deleted - it records what it was merged into.',
+    inputSchema: {
+      section: SECTION,
+      pending_id: z.number().int().describe('The id of the duplicate to fold away.'),
+      into_id: z.number().int().describe('The id of the tray item to keep.'),
+      note: z.string().optional().describe('Optional note about why these are the same thing.'),
+    },
+  }, async ({ section, pending_id, into_id, note }) => {
+    return json(db.mergePending(section, pending_id, into_id, note));
+  });
+
+  guarded('pending_dismiss', {
+    title: 'Dismiss tray item',
+    description:
+      'Decide a tray item needs nothing. It leaves the tray but stays on record with the reason - ' +
+      '"we looked and chose not to" is worth keeping.',
+    inputSchema: {
+      section: SECTION,
+      pending_id: z.number().int().describe('The id of the tray item to dismiss.'),
+      note: z.string().optional().describe('Optional reason it needs nothing.'),
+    },
+  }, async ({ section, pending_id, note }) => {
+    return json(db.resolvePending(section, pending_id, 'dismissed', { resolution_note: note }));
+  });
+
+  guarded('pending_reopen', {
+    title: 'Reopen tray item',
+    description: 'Put a resolved tray item back in the tray. Triage mistakes should be cheap to undo.',
+    inputSchema: {
+      section: SECTION,
+      pending_id: z.number().int().describe('The id of the tray item to reopen.'),
+    },
+  }, async ({ section, pending_id }) => {
+    return json(db.reopenPending(section, pending_id));
+  });
+
+  // -------------------------------------------------------------------------
+  // THE SHELF - ideas with no deadline.
+  // -------------------------------------------------------------------------
+
+  guarded('research_add', {
+    title: 'Add to shelf',
+    description:
+      'Park an idea or loose thread on the shelf. This is deliberately NOT work: no date, no ' +
+      'pressure, no expectation it ever happens. Use it for "someday", "worth a look", "I wonder ' +
+      'if" - the things that get lost because they are not urgent enough to write down anywhere else.',
+    inputSchema: {
+      section: SECTION,
+      content: z.string().describe('The idea, in your own words. Rough is fine.'),
+    },
+  }, async ({ section, content }) => {
+    return json(db.addResearchItem(section, content));
+  });
+
+  guarded('research_list', {
+    title: 'List shelf',
+    description:
+      'List open shelf items, oldest first, with a "pos" field to speak in conversation ("idea 2"). ' +
+      'An item sitting here a long time is not a backlog problem - the shelf has no deadlines. ' +
+      'Do not nudge the user about age.',
+    inputSchema: { section: SECTION },
+  }, async ({ section }) => {
+    const items = db.listResearch(section).map((item, i) => ({ pos: i + 1, ...item }));
+    return json(items);
+  });
+
+  guarded('research_promote', {
+    title: 'Promote shelf item',
+    description:
+      'Graduate an idea from the shelf into the tray: it has stopped being a maybe and now needs ' +
+      'triage like anything else that arrived.',
+    inputSchema: {
+      section: SECTION,
+      research_id: z.number().int().describe('The id of the shelf item to graduate.'),
+      note: z.string().optional().describe('Optional note about what changed to make this real.'),
+    },
+  }, async ({ section, research_id, note }) => {
+    return json(db.promoteResearch(section, research_id, note));
+  });
+
+  guarded('research_kill', {
+    title: 'Kill shelf item',
+    description:
+      'Retire an idea on purpose. Killing is a real outcome, not a failure - record why, so the same ' +
+      'idea does not get re-litigated from scratch in six months.',
+    inputSchema: {
+      section: SECTION,
+      research_id: z.number().int().describe('The id of the shelf item to retire.'),
+      note: z.string().optional().describe('Why it is dead. Worth writing - this is the part future-you wants.'),
+    },
+  }, async ({ section, research_id, note }) => {
+    return json(db.killResearch(section, research_id, note));
+  });
+
+  guarded('research_reopen', {
+    title: 'Reopen shelf item',
+    description: 'Put a promoted or killed idea back on the shelf.',
+    inputSchema: {
+      section: SECTION,
+      research_id: z.number().int().describe('The id of the shelf item to reopen.'),
+    },
+  }, async ({ section, research_id }) => {
+    return json(db.reopenResearch(section, research_id));
   });
 }
 
