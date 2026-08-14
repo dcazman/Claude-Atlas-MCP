@@ -7,13 +7,11 @@ services:
     ports:
       - "7784:7784"
     environment:
-      # Timezone reminders and the nightly groom run in. Any IANA zone name.
-      - ATLAS_TZ=UTC
-    # Optional: create .env from .env.example to set your own tokens.
-    # Without it, Atlas generates tokens on first start and prints them
-    # (docker compose logs atlas-mcp).
-    env_file:
-      - path: .env
-        required: false
+      # All optional. Compose reads a .env file in this directory if you make
+      # one (see .env.example); without it these defaults apply, and Atlas
+      # generates its own tokens on first start.
+      ATLAS_TOKEN: ${ATLAS_TOKEN:-}
+      ATLAS_TZ: ${ATLAS_TZ:-UTC}
+      ATLAS_GROOM_HOUR: ${ATLAS_GROOM_HOUR:-4}
     volumes:
       - ./data:/app/data
