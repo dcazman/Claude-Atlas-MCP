@@ -79,12 +79,23 @@ Three surfaces, in increasing order of commitment:
 
 Nothing is destroyed on the way through. Resolved items stop showing up but keep their history, including what they turned into.
 
+**How you actually see this stuff.** `get_landscape` is the one call Claude makes at the start of a conversation, so anything that needs your attention has to come back in it:
+
+| Surface | In the landscape | Why |
+|---|---|---|
+| Memory | in full | it's the context the conversation runs on |
+| Due reminders | in full | the whole point is resurfacing unasked |
+| **Tray** | **in full** | an untriaged capture is waiting on a decision from you |
+| **Shelf** | **a count only** | reciting every idea each conversation would turn a no-pressure shelf into a nagging backlog — the count says "there's something here", `research_list` shows it when you ask |
+
+So "capture now, decide later" works: whatever you drop in the tray mid-conversation comes back at the start of the next one, without you remembering it exists.
+
 ## Tools
 
 31 MCP tools.
 
 **Reading**
-- `get_landscape` — everything in a section (with `shared` merged in): all entities with their observations, plus any due reminders. Call at the start of a conversation to get oriented.
+- `get_landscape` — everything in a section (with `shared` merged in): all entities with their observations, due reminders, untriaged tray items, and a count of open shelf ideas. Call at the start of a conversation to get oriented.
 - `search` — keyword search across entities, observations, and history.
 - `get_entity` — one entity and its observations by name.
 - `get_observation` — fetch up to 20 observations directly by id. Ids are stable and never reused, which makes them a cheap way to hand specific facts from one conversation to the next.

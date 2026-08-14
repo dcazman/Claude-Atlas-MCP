@@ -242,18 +242,29 @@ function sectionEntities(section) {
 
 function getLandscape(section) {
   // Own section + shared merged: any landscape pull automatically sees shared.
-  // Entities and reminders are tagged with their origin section.
+  // Entities, reminders and tray items are tagged with their origin section.
   let entities = sectionEntities(section);
   let reminders = getActiveReminders(section).map((r) => ({ ...r, section }));
+  let tray = listPending(section).map((p) => ({ ...p, section }));
+  let shelfOpen = listResearch(section).length;
 
   if (section !== 'shared') {
     entities = entities.concat(sectionEntities('shared'));
     reminders = reminders.concat(
       getActiveReminders('shared').map((r) => ({ ...r, section: 'shared' }))
     );
+    tray = tray.concat(listPending('shared').map((p) => ({ ...p, section: 'shared' })));
+    shelfOpen += listResearch('shared').length;
   }
 
-  return { reminders, entities };
+  // The tray ships in full: an untriaged capture is waiting on a decision, and
+  // something waiting on a decision has to be visible without being asked for.
+  //
+  // The shelf ships as a COUNT only, on purpose. Listing every idea at the top
+  // of every conversation would turn a no-pressure shelf into a nagging
+  // backlog, which is the one thing it must not become. The count says "there
+  // is something here" and leaves reaching for it to the user.
+  return { reminders, tray, shelf: { open: shelfOpen }, entities };
 }
 
 function getEntity(section, name) {

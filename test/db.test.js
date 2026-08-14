@@ -72,6 +72,42 @@ test('shared is merged into every landscape pull, tagged with its origin', () =>
   assert.ok(sections.has('work') && sections.has('shared'));
 });
 
+test('the landscape surfaces the tray, and counts the shelf without listing it', () => {
+  // Nothing waiting: both surfaces report empty rather than being absent, so a
+  // client can rely on the shape.
+  const empty = db.getLandscape('personal');
+  assert.deepStrictEqual(empty.tray, []);
+  assert.deepStrictEqual(empty.shelf, { open: 0 });
+
+  db.addPendingItem('personal', 'Landlord called about the boiler', { source: 'phone' });
+  db.addResearchItem('personal', 'Learn to sail?');
+  db.addResearchItem('personal', 'Move the server rack downstairs?');
+
+  const landscape = db.getLandscape('personal');
+  assert.strictEqual(landscape.tray.length, 1, 'an untriaged capture must surface unasked');
+  assert.match(landscape.tray[0].summary, /boiler/);
+  assert.strictEqual(landscape.tray[0].section, 'personal', 'tray items carry their origin section');
+
+  // The shelf is a count, never a list - a no-pressure shelf that recites
+  // itself every conversation has become a nagging backlog.
+  assert.deepStrictEqual(landscape.shelf, { open: 2 });
+  assert.ok(!JSON.stringify(landscape.shelf).includes('sail'));
+
+  // Triaged items leave the landscape the same way they leave the tray.
+  db.resolvePending('personal', landscape.tray[0].id, 'dismissed', { resolution_note: 'handled on the call' });
+  assert.deepStrictEqual(db.getLandscape('personal').tray, []);
+});
+
+test('shared tray items surface in a work or personal landscape too', () => {
+  db.addPendingItem('shared', 'Renew the family domain');
+  const fromWork = db.getLandscape('work');
+  assert.ok(fromWork.tray.some((t) => t.section === 'shared' && /domain/.test(t.summary)));
+
+  // ...but a shared-scoped pull sees only shared, never the other sections.
+  const fromShared = db.getLandscape('shared');
+  assert.ok(fromShared.tray.every((t) => t.section === 'shared'));
+});
+
 test('timed reminders: due only after their time, and fire exactly once', () => {
   const past = db.createReminder('work', 'Stand up', '2020-01-01', null, '09:00');
   const future = db.createReminder('work', 'Renew cert', '2999-01-01', null, '09:00');
@@ -143,13 +179,14 @@ test('tray: merging folds a duplicate into the survivor', () => {
 });
 
 test('shelf: ideas graduate to the tray or get killed with a reason', () => {
+  const before = db.listResearch('personal').length;
   const idea = db.addResearchItem('personal', 'Self-hosted photo backup?').research_id;
-  assert.strictEqual(db.listResearch('personal').length, 1);
+  assert.strictEqual(db.listResearch('personal').length, before + 1);
 
   const promoted = db.promoteResearch('personal', idea, 'finally have the disks');
   assert.strictEqual(promoted.ok, true);
   assert.ok(promoted.pending_id > 0, 'graduating creates a tray item');
-  assert.strictEqual(db.listResearch('personal').length, 0);
+  assert.strictEqual(db.listResearch('personal').length, before, 'a graduated idea leaves the shelf');
   assert.strictEqual(db.getResearch('personal', idea).promoted_to, promoted.pending_id);
 
   const dead = db.addResearchItem('personal', 'Rewrite everything in Rust').research_id;

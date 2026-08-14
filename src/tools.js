@@ -106,11 +106,15 @@ function registerTools(server, auth) {
     title: 'Get landscape',
     description:
       'Get the current state of a section: every known entity (topic/project) and its observations (facts), ' +
-      'plus any due reminders (trigger_date today or earlier, not yet dismissed). ' +
-      'The "shared" section is automatically merged in - entities and reminders are tagged with their origin section. ' +
+      'any due reminders (trigger_date today or earlier, not yet dismissed), every untriaged tray item, ' +
+      'and a count of open shelf ideas. ' +
+      'The "shared" section is automatically merged in - entities, reminders and tray items are tagged with their origin section. ' +
       'Call this at the start of a conversation to get oriented on what is going on. ' +
       'If reminders come back non-empty, surface them to the user near the top of your reply - ' +
-      'that is the whole point of a reminder. Dismiss one with dismiss_reminder once handled or acknowledged.',
+      'that is the whole point of a reminder. Dismiss one with dismiss_reminder once handled or acknowledged. ' +
+      'If the tray is non-empty, mention that items are waiting for triage (briefly - it is not the agenda) ' +
+      'and offer to work through them. The shelf count is context only: mention it if it is relevant, ' +
+      'but never push the user to act on ideas - the shelf has no deadlines.',
     inputSchema: { section: SECTION },
   }, async ({ section }) => {
     return json(db.getLandscape(section));

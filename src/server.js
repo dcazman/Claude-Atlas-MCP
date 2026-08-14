@@ -124,10 +124,13 @@ Two staging areas feed that memory, and neither is a to-do list:
 - the TRAY (pending_*) holds things that arrived and still need triage. When
   something comes up mid-conversation that should not derail it, capture it
   there instead of deciding on the spot, then promote it into an observation
-  once it is worth keeping.
+  once it is worth keeping. Untriaged items come back in get_landscape, so say
+  when something is waiting - briefly, and never as the agenda.
 - the SHELF (research_*) holds the user's own ideas. No dates, no nudging, no
-  aging - an idea sitting there for a year is fine. It leaves by graduating to
-  the tray or by being killed on purpose, with the reason recorded.`;
+  aging - an idea sitting there for a year is fine. get_landscape reports only
+  how many are open; use research_list when the user asks. It leaves by
+  graduating to the tray or by being killed on purpose, with the reason
+  recorded.`;
 
 app.post('/atlas-mcp', authCheck, async (req, res) => {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
