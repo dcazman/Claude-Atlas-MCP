@@ -1,19 +1,30 @@
 #!/usr/bin/env node
 // ---------------------------------------------------------------------------
-// Atlas Groom Worker — mechanical layer (phase 2 of the groom design).
-// Runs offline (cron, 4am). Report-only for user data: findings land in a
-// "Groom Report" entity per section; nothing is deleted except audit rotation.
-// Judgment layer (Claude API via Batches, dedupe confirmation + prospecting)
-// is phase 3 and plugs in behind these findings.
-// Run: docker exec atlas node /app/src/groom.js
+// Atlas groom worker.
+//
+// Mechanical only: it finds and reports, it does not decide. Findings land in a
+// "Groom Report" entity per section for you (or Claude) to act on, and nothing
+// of yours is ever deleted - the single destructive operation is rotating the
+// server's own audit log.
+//
+// The server runs this nightly on its own (see ATLAS_GROOM_HOUR); no host cron
+// is needed. To run it by hand:
+//
+//   npm run groom                                  (bare Node)
+//   docker exec atlas-mcp node /app/src/groom.js   (container)
 // ---------------------------------------------------------------------------
 const { DatabaseSync } = require('node:sqlite');
 const path = require('node:path');
+const tz = require('./tz');
+
+// Loading the db module creates and migrates the schema as a side effect. The
+// groom can therefore be the FIRST thing ever run against a brand new database
+// file - without this it would open an empty file and fail on the first query.
+require('./db');
 
 const DB_PATH = process.env.ATLAS_DB_PATH || path.join(__dirname, '..', 'data', 'atlas.db');
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
-db.exec(`CREATE TABLE IF NOT EXISTS groom_meta (key TEXT PRIMARY KEY, value TEXT);`);
 
 const SECTIONS = ['work', 'personal', 'shared'];
 const REPORT_ENTITY = 'Groom Report';
@@ -55,7 +66,11 @@ function groomSection(section) {
 
   let scanned = 0, skipped = 0;
   for (const e of entities) {
-    if (lastRunTs && e.updated_at <= lastRunTs) { skipped++; continue; }
+    // Strictly-less, not <=: timestamps land on whole seconds, so an entity
+    // changed during the same second the last run was recorded would otherwise
+    // be skipped for good. Re-scanning a boundary entity is cheap and
+    // idempotent; missing a finding forever is not.
+    if (lastRunTs && e.updated_at < lastRunTs) { skipped++; continue; }
     scanned++;
     const dupes = findDupes(e.id);
     for (const d of dupes) {
@@ -88,8 +103,8 @@ function groomSection(section) {
   }
   db.prepare('DELETE FROM observations WHERE entity_id = ? AND protected = 0').run(entity.id);
 
-  const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  const header = `Groom run ${stamp} UTC — scanned ${scanned} changed entities, skipped ${skipped} unchanged, ${findings.length} finding(s).`;
+  // Stamped in the display timezone, like every other time Atlas shows you.
+  const header = `Groom run ${tz.format()} — scanned ${scanned} changed entities, skipped ${skipped} unchanged, ${findings.length} finding(s).`;
   db.prepare('INSERT INTO observations (entity_id, content) VALUES (?, ?)').run(entity.id, header);
   for (const f of findings.slice(0, 40)) {
     db.prepare('INSERT INTO observations (entity_id, content) VALUES (?, ?)').run(entity.id, f);

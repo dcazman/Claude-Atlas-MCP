@@ -29,27 +29,47 @@ No `.env`, no token, no config. On first start Atlas creates the database, gener
   Connect a client to:  http://localhost:7784/atlas-mcp?token=<one of the above>
 ```
 
-The tokens are saved next to the database and reused on every restart. Data lives in `./data`, a single SQLite file. That's the whole setup — everything below is optional.
+The tokens are saved next to the database and reused on every restart. Data lives in `./data`, a single SQLite file. That's the whole setup.
+
+**Check it worked:**
+
+```bash
+curl -s localhost:7784/health
+# {"ok":true,"service":"atlas-mcp","version":2,"port":"7784"}
+
+TOKEN=<one of the tokens printed above>
+curl -s -X POST localhost:7784/atlas-mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -H "x-atlas-token: $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":
+       {"name":"add_observation","arguments":
+        {"section":"work","entity":"Atlas","content":"Installed today."}}}'
+```
+
+If that returns an `observation_id`, the whole stack works: your first memory is on disk and Claude can read it back.
 
 <details>
 <summary>Prebuilt image, bare Node, or your own tokens</summary>
 
-CI publishes an image on every push to `main`:
+CI publishes an image on every push to `main`, if you'd rather not build:
 
 ```bash
 docker run -d --name atlas -p 7784:7784 -v "$PWD/atlas-data:/app/data" \
   ghcr.io/dcazman/claude-atlas-mcp:latest
+docker logs atlas
 ```
 
-Bare Node (22+, for built-in `node:sqlite` — no native dependencies, nothing to compile):
+Bare Node — 22.13+ for built-in `node:sqlite`. No native dependencies, nothing to compile:
 
 ```bash
 npm install
 npm start
 ```
 
-To choose your own tokens or timezone instead of the generated ones,
-`cp .env.example .env` before starting and edit it.
+To choose your own tokens, timezone, or groom hour instead of the defaults,
+`cp .env.example .env` and uncomment what you want. Copying it unedited changes
+nothing — every line is commented out on purpose.
 </details>
 
 ## Data model
@@ -239,6 +259,11 @@ fire exactly once, and the funnel moves items the way it claims to.
 ## Security
 
 See [SECURITY.md](SECURITY.md) for the threat model, deployment hardening notes, and how to report a vulnerability.
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md). The short version: v3 added the tray, the
+shelf, timed reminders, observation-id addressing, and a zero-config start.
 
 ## License
 
