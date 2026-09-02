@@ -76,7 +76,7 @@ nothing — every line is commented out on purpose.
 
 | Concept | What it is |
 |---------|-----------|
-| **Entity** | A topic or project you want Claude to track (e.g. "Home Network", "Q3 Planning"). Has a name and a one-line summary. |
+| **Entity** | A topic or project you want Claude to track (e.g. "Home Network", "Q3 Planning"). Has a name, a one-line summary, and a **core** flag (see below). |
 | **Observation** | A single fact attached to an entity ("switched the router to the 6E band on 2026-06-01"). The atomic unit of memory. Editable in place, and markable **protected** so it can be corrected but never deleted. |
 | **History event** | A notable thing that happened, logged to the timeline for later recall. |
 | **Reminder** | A note with a `trigger_date`. Once the date arrives it auto-surfaces at the start of a conversation and stays until dismissed. Add a `trigger_time` and it becomes a **timed** reminder meant to be delivered once, by something that polls for it. |
@@ -99,11 +99,17 @@ Three surfaces, in increasing order of commitment:
 
 Nothing is destroyed on the way through. Resolved items stop showing up but keep their history, including what they turned into.
 
+### The core memory tier
+
+Every entity has a **core** flag, off by default. `get_landscape` only returns core entities — that's the bounded "working memory" view, not a full dump of everything you've ever recorded. `promote_entity` and `evict_entity` move an entity into or out of that view, explicitly; nothing gets promoted automatically just by being touched or created. Eviction never deletes anything — an evicted entity is still fully there, just reachable by name (`get_entity`) or keyword (`search`) instead of showing up unasked.
+
+The reasoning: the default boot call should stay small and predictable no matter how much history you've piled up, and the explicit two-tier shape (rather than something that fades entities out automatically over time) matches how the rest of Atlas already works — nothing here happens silently. When you genuinely need everything, `get_landscape` takes `all: true`, and `list_entities` gives you a lightweight name/summary/core-flag/observation-count sweep over the whole section without dragging every observation along, for a browse pass before you decide what to promote or evict.
+
 **How you actually see this stuff.** `get_landscape` is the one call Claude makes at the start of a conversation, so anything that needs your attention has to come back in it:
 
 | Surface | In the landscape | Why |
 |---|---|---|
-| Memory | in full | it's the context the conversation runs on |
+| Memory | **core entities only** | it's the context the conversation runs on, but bounded — see "The core memory tier" above; `all: true` still gets you everything |
 | Due reminders | in full | the whole point is resurfacing unasked |
 | **Tray** | **in full** | an untriaged capture is waiting on a decision from you |
 | **Shelf** | **a count only** | reciting every idea each conversation would turn a no-pressure shelf into a nagging backlog — the count says "there's something here", `research_list` shows it when you ask |
@@ -112,23 +118,26 @@ So "capture now, decide later" works: whatever you drop in the tray mid-conversa
 
 ## Tools
 
-31 MCP tools.
+35 MCP tools.
 
 **Reading**
-- `get_landscape` — everything in a section (with `shared` merged in): all entities with their observations, due reminders, untriaged tray items, and a count of open shelf ideas. Call at the start of a conversation to get oriented.
+- `get_landscape` — the bounded view of a section (with `shared` merged in): core entities with their observations, due reminders, untriaged tray items, and a count of open shelf ideas. Call at the start of a conversation to get oriented. Pass `all: true` for the old full-dump behavior.
 - `search` — keyword search across entities, observations, and history.
 - `get_entity` — one entity and its observations by name.
+- `list_entities` — every entity in a section, core or not, with name/summary/core flag/observation count only — a lightweight full-coverage sweep, never observation bodies.
 - `get_observation` — fetch up to 20 observations directly by id. Ids are stable and never reused, which makes them a cheap way to hand specific facts from one conversation to the next.
 - `get_history` — the timeline of logged events.
 - `get_time` — current time plus how long since this token's last call.
 
 **Writing**
-- `upsert_entity` — create or update an entity's name/summary.
-- `add_observation` — attach a fact to an entity.
+- `upsert_entity` — create or update an entity's name/summary. Redirects silently through a known alias; flags `similar_entities` on a merely-similar new name (never blocks).
+- `add_observation` — attach a fact to an entity. Same alias/similarity gate as `upsert_entity` on creation.
 - `update_observation` — edit a fact in place; the id stays stable. Works on protected rows.
 - `remove_observation` — drop a fact that's stale or done (refuses if protected).
 - `protect_observation` / `unprotect_observation` — mark a fact undeletable, or lift that.
 - `remove_entity` — delete an entity and its observations (refuses if any is protected).
+- `merge_entity` — fold a duplicate entity into the one you're keeping; moves its observations over and records the duplicate name as a permanent alias.
+- `promote_entity` / `evict_entity` — move an entity into or out of the core memory tier (see above). Eviction never deletes — the entity stays reachable via `get_entity`/`search`.
 - `log_event` — record a notable event to history.
 
 **Reminders**
@@ -262,8 +271,9 @@ See [SECURITY.md](SECURITY.md) for the threat model, deployment hardening notes,
 
 ## Changes
 
-See [CHANGELOG.md](CHANGELOG.md). The short version: v3 added the tray, the
-shelf, timed reminders, observation-id addressing, and a zero-config start.
+See [CHANGELOG.md](CHANGELOG.md). The short version: v4 bounded `get_landscape`
+to a core memory tier and added entity merge/dedup tooling; v3 added the tray,
+the shelf, timed reminders, observation-id addressing, and a zero-config start.
 
 ## License
 

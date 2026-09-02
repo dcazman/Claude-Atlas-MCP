@@ -82,9 +82,36 @@ test('every tool is advertised', async () => {
   const res = await rpc(WORK_TOKEN, 'tools/list');
   const names = res.result.tools.map((t) => t.name);
   for (const expected of ['get_landscape', 'get_observation', 'list_due_reminders',
-    'mark_reminder_fired', 'pending_add', 'pending_promote', 'research_add', 'research_kill']) {
+    'mark_reminder_fired', 'pending_add', 'pending_promote', 'research_add', 'research_kill',
+    'promote_entity', 'evict_entity', 'list_entities', 'merge_entity']) {
     assert.ok(names.includes(expected), `tools/list is missing ${expected}`);
   }
+});
+
+test('core memory tier: get_landscape is bounded by default, all:true still works, promote/evict/list/merge round-trip over HTTP', async () => {
+  await call(WORK_TOKEN, 'upsert_entity', { section: 'work', name: 'HTTP Core A', summary: 'active' });
+  await call(WORK_TOKEN, 'upsert_entity', { section: 'work', name: 'HTTP Core B', summary: 'archived' });
+
+  const boundedBefore = jsonOf(await call(WORK_TOKEN, 'get_landscape', { section: 'work' }));
+  assert.ok(!boundedBefore.entities.some((e) => e.name === 'HTTP Core A'), 'brand-new entities start out of core');
+
+  await call(WORK_TOKEN, 'promote_entity', { section: 'work', name: 'HTTP Core A' });
+  const bounded = jsonOf(await call(WORK_TOKEN, 'get_landscape', { section: 'work' }));
+  assert.ok(bounded.entities.some((e) => e.name === 'HTTP Core A'));
+  assert.ok(!bounded.entities.some((e) => e.name === 'HTTP Core B'));
+
+  const all = jsonOf(await call(WORK_TOKEN, 'get_landscape', { section: 'work', all: true }));
+  assert.ok(all.entities.some((e) => e.name === 'HTTP Core B'), 'all:true still reaches the archived entity');
+
+  const list = jsonOf(await call(WORK_TOKEN, 'list_entities', { section: 'work' }));
+  assert.ok(list.some((e) => e.name === 'HTTP Core A') && list.some((e) => e.name === 'HTTP Core B'));
+
+  await call(WORK_TOKEN, 'evict_entity', { section: 'work', name: 'HTTP Core A' });
+  const afterEvict = jsonOf(await call(WORK_TOKEN, 'get_landscape', { section: 'work' }));
+  assert.ok(!afterEvict.entities.some((e) => e.name === 'HTTP Core A'));
+
+  const merged = await call(WORK_TOKEN, 'merge_entity', { section: 'work', from: 'HTTP Core B', into: 'HTTP Core A' });
+  assert.match(textOf(merged), /Merged "HTTP Core B" into "HTTP Core A"/);
 });
 
 test('scope matrix: a token reaches its own section and shared, nothing else', async () => {

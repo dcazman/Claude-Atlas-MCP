@@ -20,13 +20,16 @@ test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 test('blank slate: an empty database migrates to the current schema', () => {
   const raw = new DatabaseSync(process.env.ATLAS_DB_PATH, { readOnly: true });
   const version = raw.prepare('PRAGMA user_version').get().user_version;
-  assert.strictEqual(version, 3, 'fresh database should land on the current user_version');
+  assert.strictEqual(version, 5, 'fresh database should land on the current user_version');
 
   const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
   for (const expected of ['entities', 'observations', 'events', 'reminders', 'audit_log',
-    'groom_meta', 'pending_items', 'research_items']) {
+    'groom_meta', 'pending_items', 'research_items', 'entity_aliases']) {
     assert.ok(tables.includes(expected), `missing table ${expected}`);
   }
+
+  const cols = raw.prepare("PRAGMA table_info(entities)").all().map((c) => c.name);
+  assert.ok(cols.includes('core'), 'entities should have a core column');
 });
 
 test('observations: add, update in place, protect, delete', () => {
@@ -67,9 +70,109 @@ test('obs-number addressing resolves scope from the row, not the caller', () => 
 
 test('shared is merged into every landscape pull, tagged with its origin', () => {
   db.addObservation('shared', 'House Rules', 'Shared context lives here.');
-  const landscape = db.getLandscape('work');
+  // get_landscape defaults to core=1 entities only (see v4 migration) - use
+  // all:true here since this test is about the shared-merge behavior, not core.
+  const landscape = db.getLandscape('work', { all: true });
   const sections = new Set(landscape.entities.map((e) => e.section));
   assert.ok(sections.has('work') && sections.has('shared'));
+});
+
+test('core memory tier: get_landscape defaults to core=1 entities, all:true dumps everything', () => {
+  db.upsertEntity('work', 'Core Tier A', 'in the working set');
+  db.upsertEntity('work', 'Core Tier B', 'archived, not active');
+  db.setEntityCore('work', 'Core Tier A', true);
+
+  const bounded = db.getLandscape('work');
+  const boundedNames = bounded.entities.map((e) => e.name);
+  assert.ok(boundedNames.includes('Core Tier A'), 'core entity should appear in the default view');
+  assert.ok(!boundedNames.includes('Core Tier B'), 'non-core entity should not appear in the default view');
+  assert.strictEqual(bounded.view, 'core');
+
+  const all = db.getLandscape('work', { all: true });
+  const allNames = all.entities.map((e) => e.name);
+  assert.ok(allNames.includes('Core Tier A') && allNames.includes('Core Tier B'), 'all:true returns every entity');
+  assert.strictEqual(all.view, 'all');
+});
+
+test('promote_entity / evict_entity move an entity in and out of the core view without deleting it', () => {
+  db.upsertEntity('work', 'Toggle Me', 'a topic');
+  assert.strictEqual(db.getEntity('work', 'Toggle Me').core, 0, 'new entities start out of core');
+
+  const promoted = db.setEntityCore('work', 'Toggle Me', true);
+  assert.deepStrictEqual(promoted, { ok: true, name: 'Toggle Me', core: 1 });
+  assert.ok(db.getLandscape('work').entities.some((e) => e.name === 'Toggle Me'));
+
+  const evicted = db.setEntityCore('work', 'Toggle Me', false);
+  assert.deepStrictEqual(evicted, { ok: true, name: 'Toggle Me', core: 0 });
+  assert.ok(!db.getLandscape('work').entities.some((e) => e.name === 'Toggle Me'), 'evicted entity leaves the default view');
+  assert.ok(db.getEntity('work', 'Toggle Me'), 'but it is still fully intact via get_entity');
+
+  assert.deepStrictEqual(db.setEntityCore('work', 'No Such Entity', true), { ok: false, reason: 'not_found' });
+});
+
+test('list_entities enumerates everything regardless of core status, with observation counts', () => {
+  db.upsertEntity('personal', 'Listed Core', 'x');
+  db.setEntityCore('personal', 'Listed Core', true);
+  db.upsertEntity('personal', 'Listed Archived', 'y');
+  db.addObservation('personal', 'Listed Archived', 'one fact');
+  db.addObservation('personal', 'Listed Archived', 'two facts');
+
+  const rows = db.listEntities('personal');
+  const core = rows.find((r) => r.name === 'Listed Core');
+  const archived = rows.find((r) => r.name === 'Listed Archived');
+  assert.strictEqual(core.core, 1);
+  assert.strictEqual(archived.core, 0);
+  assert.strictEqual(archived.observation_count, 2);
+  assert.ok(!('observations' in archived), 'list_entities never carries observation bodies');
+});
+
+test('merge_entity moves observations, keeps protected ones intact, and records a permanent alias', () => {
+  const keep = db.addObservation('work', 'Merge Survivor', 'already here').observation_id;
+  const dupeObs = db.addObservation('work', 'Merge Dupe', 'a fact worth keeping').observation_id;
+  db.setObservationProtected('work', dupeObs, true);
+  db.addObservation('work', 'Merge Dupe', 'an unprotected fact');
+
+  assert.deepStrictEqual(db.mergeEntity('work', 'Merge Dupe', 'Merge Dupe'), { ok: false, reason: 'same_entity' });
+  assert.deepStrictEqual(db.mergeEntity('work', 'Nope', 'Merge Survivor'), { ok: false, reason: 'from_not_found' });
+  assert.deepStrictEqual(db.mergeEntity('work', 'Merge Dupe', 'Nope'), { ok: false, reason: 'into_not_found' });
+
+  const r = db.mergeEntity('work', 'Merge Dupe', 'Merge Survivor');
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.moved, 2);
+  assert.strictEqual(db.getEntity('work', 'Merge Dupe'), null, 'the merged-away entity is gone');
+
+  const survivor = db.getEntity('work', 'Merge Survivor');
+  assert.ok(survivor.observations.some((o) => o.id === dupeObs && o.protected === 1), 'protected obs kept its id and flag');
+  assert.ok(survivor.observations.some((o) => /MERGED IN from "Merge Dupe"/.test(o.content)), 'unprotected obs copied with provenance');
+
+  // recreating the dead name redirects silently from now on
+  assert.strictEqual(db.resolveAlias('work', 'Merge Dupe'), 'Merge Survivor');
+  const redirected = db.upsertEntity('work', 'Merge Dupe');
+  assert.strictEqual(redirected.name, 'Merge Survivor');
+  assert.match(redirected.redirected, /known alias/);
+});
+
+test('upsert_entity and add_observation redirect a merged-away name through its alias', () => {
+  db.addObservation('personal', 'Alias Survivor', 'kept');
+  db.addObservation('personal', 'Alias Dead', 'to be merged');
+  db.mergeEntity('personal', 'Alias Dead', 'Alias Survivor');
+
+  const viaAdd = db.addObservation('personal', 'Alias Dead', 'a brand new fact');
+  assert.strictEqual(viaAdd.entity, 'Alias Survivor');
+  assert.match(viaAdd.redirected, /Alias Dead.*Alias Survivor/);
+  assert.ok(db.getEntity('personal', 'Alias Survivor').observations.some((o) => o.content === 'a brand new fact'));
+});
+
+test('a brand-new but merely-similar entity name still creates, flagged for a human to check', () => {
+  db.upsertEntity('work', 'Home Network Router', 'the router');
+  const similar = db.upsertEntity('work', 'Home Network Router Config');
+  assert.ok(similar.similar_entities && similar.similar_entities.length > 0, 'a close name should surface a similarity hint');
+  assert.strictEqual(similar.similar_entities[0].name, 'Home Network Router');
+  // creation always succeeds regardless - never blocked, only flagged
+  assert.ok(db.getEntity('work', 'Home Network Router Config'));
+
+  const unrelated = db.upsertEntity('work', 'Completely Unrelated Topic Xyz');
+  assert.ok(!unrelated.similar_entities, 'an unrelated name gets no similarity hint');
 });
 
 test('the landscape surfaces the tray, and counts the shelf without listing it', () => {
