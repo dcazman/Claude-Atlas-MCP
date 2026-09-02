@@ -98,6 +98,46 @@ if (db.prepare('PRAGMA user_version').get().user_version < 3) {
   console.log('atlas v3 migration complete (timed reminders, tray, shelf)');
 }
 
+// ---------------------------------------------------------------------------
+// v4 MIGRATION (additive, idempotent, guarded by PRAGMA user_version)
+// Adds entities.core: a bounded "working memory" tier, same shape as MemGPT's
+// core-vs-archival split. get_landscape defaults to core=1 entities (plus due
+// reminders, the tray, and the shelf count) instead of dumping the whole
+// section; promote_entity/evict_entity toggle the flag explicitly. Nothing
+// auto-promotes - a brand-new entity starts core=0 like every other entity,
+// and eviction never deletes anything, it just leaves the default view
+// (still reachable via search or get_entity by name).
+// ---------------------------------------------------------------------------
+if (db.prepare('PRAGMA user_version').get().user_version < 4) {
+  try { db.exec('ALTER TABLE entities ADD COLUMN core INTEGER NOT NULL DEFAULT 0'); } catch (e) { /* fresh DB or already present */ }
+  db.exec('PRAGMA user_version = 4;');
+  console.log('atlas v4 migration complete (core memory tier)');
+}
+
+// ---------------------------------------------------------------------------
+// v5 MIGRATION (additive, idempotent, guarded by PRAGMA user_version)
+// Adds entity_aliases: a settled "this name was merged away" redirect table,
+// written by merge_entity and consulted by upsert_entity/add_observation so
+// recreating a merged-away name lands back on the surviving entity instead of
+// silently forking a duplicate. This is deliberately separate from the
+// same-section similarity check (see findSimilarEntityNames below) - an alias
+// is a resolved prior decision and redirects silently; a similarity hit is NOT
+// settled and is only ever surfaced back to the caller, never auto-merged.
+// ---------------------------------------------------------------------------
+if (db.prepare('PRAGMA user_version').get().user_version < 5) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_aliases (
+      section TEXT NOT NULL CHECK (section IN ('work','personal','shared')),
+      dead_name TEXT NOT NULL,
+      canonical_name TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (section, dead_name)
+    );
+  `);
+  db.exec('PRAGMA user_version = 5;');
+  console.log('atlas v5 migration complete (entity aliases)');
+}
+
 db.exec(`
   PRAGMA foreign_keys = ON;
 
@@ -106,6 +146,7 @@ db.exec(`
     section TEXT NOT NULL CHECK (section IN ('work','personal','shared')),
     name TEXT NOT NULL,
     summary TEXT,
+    core INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(section, name)
   );
@@ -198,6 +239,7 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_entities_section ON entities(section);
+  CREATE INDEX IF NOT EXISTS idx_entities_section_core ON entities(section, core);
   CREATE INDEX IF NOT EXISTS idx_observations_entity ON observations(entity_id);
   CREATE INDEX IF NOT EXISTS idx_events_section ON events(section);
   CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_id);
@@ -208,8 +250,99 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_research_section_state ON research_items(section, state);
 `);
 
+// ---------------------------------------------------------------------------
+// Entity name matching helpers: token-overlap (Jaccard) similarity, used only
+// to WARN about a possible duplicate on creation - never to block or merge
+// automatically. See findSimilarEntityNames / ensureEntityChecked below.
+// ---------------------------------------------------------------------------
+function nameTokens(s) {
+  return new Set(s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2));
+}
+function nameJaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+const NAME_SIMILARITY_THRESHOLD = 0.5;
+
+// Same-section + shared, same merge rule get_landscape already uses.
+function findSimilarEntityNames(section, name) {
+  const toks = nameTokens(name);
+  if (!toks.size) return [];
+  const candidates = section === 'shared'
+    ? db.prepare("SELECT name, section FROM entities WHERE section = 'shared'").all()
+    : db.prepare("SELECT name, section FROM entities WHERE section IN (?, 'shared')").all(section);
+  const out = [];
+  for (const c of candidates) {
+    if (c.name === name) continue;
+    const sim = nameJaccard(toks, nameTokens(c.name));
+    if (sim >= NAME_SIMILARITY_THRESHOLD) out.push({ name: c.name, section: c.section, similarity: Math.round(sim * 100) / 100 });
+  }
+  return out.sort((a, b) => b.similarity - a.similarity).slice(0, 3);
+}
+
+// A dead_name -> canonical_name redirect recorded by merge_entity. Resolved
+// silently wherever a brand-new entity is about to be created - a settled
+// prior decision, not a judgment call.
+function resolveAlias(section, name) {
+  const row = db.prepare('SELECT canonical_name FROM entity_aliases WHERE section = ? AND dead_name = ?').get(section, name);
+  return row ? row.canonical_name : null;
+}
+
+function recordAlias(section, deadName, canonicalName) {
+  db.prepare(
+    `INSERT INTO entity_aliases (section, dead_name, canonical_name) VALUES (?, ?, ?)
+     ON CONFLICT(section, dead_name) DO UPDATE SET canonical_name = excluded.canonical_name`
+  ).run(section, deadName, canonicalName);
+}
+
+// The gate: called wherever a brand-new entity is about to be created by name
+// (add_observation, upsert_entity). Never blocks - a write always succeeds -
+// but tells the caller what it found: a known alias redirects silently
+// (settled), a merely-similar name still creates but comes back flagged
+// (not settled, needs a human/Claude judgment call).
+function ensureEntityChecked(section, name) {
+  const alias = resolveAlias(section, name);
+  if (alias && alias !== name) {
+    return { entity: ensureEntity(section, alias), redirectedFrom: name, similar: [] };
+  }
+  const existing = findEntity(section, name);
+  if (existing) return { entity: existing, redirectedFrom: null, similar: [] };
+  const similar = findSimilarEntityNames(section, name);
+  return { entity: ensureEntity(section, name), redirectedFrom: null, similar };
+}
+
+// Merge "from" into "into": every observation moves or copies over (protected
+// ones move as-is, keeping their id and protection; unprotected ones copy in
+// with a "MERGED IN from X" prefix so the provenance isn't lost), "from" is
+// recorded as a permanent alias of "into", then the now-empty "from" entity is
+// deleted. Use only after confirming with get_entity on both that this really
+// is the same topic - merging two related-but-distinct entities is worse than
+// leaving them separate.
+function mergeEntity(section, fromName, intoName) {
+  const from = findEntity(section, fromName);
+  const into = findEntity(section, intoName);
+  if (!from) return { ok: false, reason: 'from_not_found' };
+  if (!into) return { ok: false, reason: 'into_not_found' };
+  if (from.id === into.id) return { ok: false, reason: 'same_entity' };
+  const fromObs = db.prepare('SELECT id, content, protected FROM observations WHERE entity_id = ?').all(from.id);
+  for (const o of fromObs) {
+    if (o.protected) {
+      db.prepare('UPDATE observations SET entity_id = ? WHERE id = ?').run(into.id, o.id);
+    } else {
+      db.prepare('INSERT INTO observations (entity_id, content) VALUES (?, ?)')
+        .run(into.id, `MERGED IN from "${fromName}" (obs ${o.id}): ${o.content}`);
+    }
+  }
+  recordAlias(section, fromName, intoName);
+  db.prepare('DELETE FROM entities WHERE id = ?').run(from.id);
+  touchEntity(into.id);
+  return { ok: true, moved: fromObs.length, into: intoName };
+}
+
 function findEntity(section, name) {
-  return db.prepare('SELECT id, name, summary, updated_at FROM entities WHERE section = ? AND name = ?').get(section, name);
+  return db.prepare('SELECT id, name, summary, core, updated_at FROM entities WHERE section = ? AND name = ?').get(section, name);
 }
 
 function touchEntity(id) {
@@ -225,10 +358,21 @@ function ensureEntity(section, name) {
   return entity;
 }
 
-function sectionEntities(section) {
-  const entities = db.prepare(
-    'SELECT id, name, summary, updated_at FROM entities WHERE section = ? ORDER BY updated_at DESC'
-  ).all(section);
+// Move an entity into (true) or out of (false) the core working-memory tier.
+// Explicit only - nothing here auto-promotes or auto-evicts. Eviction never
+// deletes anything; the entity stays fully reachable via get_entity/search.
+function setEntityCore(section, name, value) {
+  const entity = findEntity(section, name);
+  if (!entity) return { ok: false, reason: 'not_found' };
+  db.prepare('UPDATE entities SET core = ? WHERE id = ?').run(value ? 1 : 0, entity.id);
+  return { ok: true, name, core: value ? 1 : 0 };
+}
+
+function sectionEntities(section, { coreOnly = false } = {}) {
+  const sql = coreOnly
+    ? 'SELECT id, name, summary, core, updated_at FROM entities WHERE section = ? AND core = 1 ORDER BY updated_at DESC'
+    : 'SELECT id, name, summary, core, updated_at FROM entities WHERE section = ? ORDER BY updated_at DESC';
+  const entities = db.prepare(sql).all(section);
 
   for (const e of entities) {
     e.section = section;
@@ -240,16 +384,40 @@ function sectionEntities(section) {
   return entities;
 }
 
-function getLandscape(section) {
+// Lightweight full-coverage enumeration: every entity in a section (own +
+// shared), core or not, with just name/summary/core/observation_count - never
+// observation bodies. This is the complement to get_landscape's bounded core
+// view and get_entity's one-topic-in-full: use this for a browse/audit pass
+// over everything, then get_entity on whichever ones need a closer look.
+function listEntities(section) {
+  const withCounts = (rows, sec) => rows.map((r) => ({
+    ...r,
+    section: sec,
+    observation_count: db.prepare('SELECT COUNT(*) n FROM observations WHERE entity_id = ?').get(r.id).n,
+  }));
+  const own = withCounts(
+    db.prepare('SELECT id, name, summary, core, updated_at FROM entities WHERE section = ? ORDER BY updated_at DESC').all(section),
+    section
+  );
+  if (section === 'shared') return own;
+  const shared = withCounts(
+    db.prepare("SELECT id, name, summary, core, updated_at FROM entities WHERE section = 'shared' ORDER BY updated_at DESC").all(),
+    'shared'
+  );
+  return own.concat(shared);
+}
+
+function getLandscape(section, { all = false } = {}) {
   // Own section + shared merged: any landscape pull automatically sees shared.
   // Entities, reminders and tray items are tagged with their origin section.
-  let entities = sectionEntities(section);
+  const opts = { coreOnly: !all };
+  let entities = sectionEntities(section, opts);
   let reminders = getActiveReminders(section).map((r) => ({ ...r, section }));
   let tray = listPending(section).map((p) => ({ ...p, section }));
   let shelfOpen = listResearch(section).length;
 
   if (section !== 'shared') {
-    entities = entities.concat(sectionEntities('shared'));
+    entities = entities.concat(sectionEntities('shared', opts));
     reminders = reminders.concat(
       getActiveReminders('shared').map((r) => ({ ...r, section: 'shared' }))
     );
@@ -257,14 +425,14 @@ function getLandscape(section) {
     shelfOpen += listResearch('shared').length;
   }
 
-  // The tray ships in full: an untriaged capture is waiting on a decision, and
-  // something waiting on a decision has to be visible without being asked for.
-  //
-  // The shelf ships as a COUNT only, on purpose. Listing every idea at the top
-  // of every conversation would turn a no-pressure shelf into a nagging
-  // backlog, which is the one thing it must not become. The count says "there
-  // is something here" and leaves reaching for it to the user.
-  return { reminders, tray, shelf: { open: shelfOpen }, entities };
+  // The bounded default is core=1 entities only - see the v4 migration note
+  // above for why. Pass { all: true } for the old full-dump behavior; that is
+  // the worst case, not the normal path. The tray still ships in full (an
+  // untriaged capture is waiting on a decision, and that has to be visible
+  // without being asked for) and the shelf still ships as a count only (see
+  // the funnel comment above listResearch) - neither is affected by core/all,
+  // since neither one was ever the source of an oversized response.
+  return { reminders, tray, shelf: { open: shelfOpen }, entities, view: all ? 'all' : 'core' };
 }
 
 function getEntity(section, name) {
@@ -282,8 +450,16 @@ function getEntity(section, name) {
   return entity;
 }
 
+// Search-gated on creation: a brand-new name that is a known alias (merged
+// away by merge_entity) redirects silently to the surviving entity (result
+// carries "redirected"); a brand-new name that is merely similar to an
+// existing one still creates it, but the result carries "similar_entities" so
+// the caller can check before assuming this is really new.
 function upsertEntity(section, name, summary) {
-  const existing = findEntity(section, name);
+  const alias = resolveAlias(section, name);
+  const targetName = alias && alias !== name ? alias : name;
+  const existing = findEntity(section, targetName);
+  let similar = [];
   if (existing) {
     if (summary !== undefined && summary !== null) {
       db.prepare("UPDATE entities SET summary = ?, updated_at = datetime('now') WHERE id = ?").run(summary, existing.id);
@@ -291,9 +467,13 @@ function upsertEntity(section, name, summary) {
       touchEntity(existing.id);
     }
   } else {
-    db.prepare('INSERT INTO entities (section, name, summary) VALUES (?, ?, ?)').run(section, name, summary ?? null);
+    similar = findSimilarEntityNames(section, targetName);
+    db.prepare('INSERT INTO entities (section, name, summary) VALUES (?, ?, ?)').run(section, targetName, summary ?? null);
   }
-  return getEntity(section, name);
+  const result = getEntity(section, targetName);
+  if (alias && alias !== name) result.redirected = `"${name}" is a known alias for "${targetName}" - wrote there instead.`;
+  if (similar.length) result.similar_entities = similar;
+  return result;
 }
 
 function removeEntity(section, name) {
@@ -305,11 +485,17 @@ function removeEntity(section, name) {
   return { ok: true };
 }
 
+// Search-gated the same way as upsertEntity: creating a brand-new entity by
+// name here goes through the alias/similarity gate too, since this is the
+// other place a fresh entity name gets typed in from scratch.
 function addObservation(section, entityName, content) {
-  const entity = ensureEntity(section, entityName);
+  const { entity, redirectedFrom, similar } = ensureEntityChecked(section, entityName);
   touchEntity(entity.id);
   const info = db.prepare('INSERT INTO observations (entity_id, content) VALUES (?, ?)').run(entity.id, content);
-  return { observation_id: info.lastInsertRowid, entity: entityName };
+  const result = { observation_id: info.lastInsertRowid, entity: entity.name };
+  if (redirectedFrom) result.redirected = `"${redirectedFrom}" is a known alias for "${entity.name}" - wrote there instead.`;
+  if (similar.length) result.similar_entities = similar;
+  return result;
 }
 
 function getObservation(section, observationId) {
@@ -658,9 +844,13 @@ function setGroomMeta(key, value) {
 
 module.exports = {
   getLandscape,
+  listEntities,
   getEntity,
   upsertEntity,
   removeEntity,
+  setEntityCore,
+  mergeEntity,
+  resolveAlias,
   addObservation,
   getObservation,
   getObservationsByIds,

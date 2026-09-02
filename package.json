@@ -1,7 +1,7 @@
 {
   "name": "atlas-mcp",
-  "version": "3.0.0",
-  "description": "Self-hosted MCP server that gives Claude persistent memory across conversations - entities, observations, history, timed reminders, a triage tray and an idea shelf, work/personal/shared sections with scoped tokens, and a nightly groom worker - in a lightweight Node/SQLite backend you run yourself.",
+  "version": "4.0.0",
+  "description": "Self-hosted MCP server that gives Claude persistent memory across conversations - entities, observations, history, timed reminders, a bounded core memory tier, a triage tray and an idea shelf, work/personal/shared sections with scoped tokens, and a nightly groom worker - in a lightweight Node/SQLite backend you run yourself.",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

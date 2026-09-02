@@ -29,7 +29,7 @@ test('the groom can be the first thing ever run against a new database', () => {
     assert.match(out, /groom complete/);
 
     const raw = new DatabaseSync(dbPath, { readOnly: true });
-    assert.strictEqual(raw.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.strictEqual(raw.prepare('PRAGMA user_version').get().user_version, 5);
     const reports = raw.prepare("SELECT COUNT(*) n FROM entities WHERE name = 'Groom Report'").get().n;
     assert.strictEqual(reports, 3, 'one report entity per section');
   } finally {

@@ -105,19 +105,73 @@ function registerTools(server, auth) {
   guarded('get_landscape', {
     title: 'Get landscape',
     description:
-      'Get the current state of a section: every known entity (topic/project) and its observations (facts), ' +
-      'any due reminders (trigger_date today or earlier, not yet dismissed), every untriaged tray item, ' +
-      'and a count of open shelf ideas. ' +
+      'Get the current bounded state of a section: only entities currently marked "core" (the working-memory ' +
+      'tier - see promote_entity/evict_entity) and their observations, plus any due reminders (trigger_date ' +
+      'today or earlier, not yet dismissed), every untriaged tray item, and a count of open shelf ideas. ' +
       'The "shared" section is automatically merged in - entities, reminders and tray items are tagged with their origin section. ' +
       'Call this at the start of a conversation to get oriented on what is going on. ' +
       'If reminders come back non-empty, surface them to the user near the top of your reply - ' +
       'that is the whole point of a reminder. Dismiss one with dismiss_reminder once handled or acknowledged. ' +
       'If the tray is non-empty, mention that items are waiting for triage (briefly - it is not the agenda) ' +
       'and offer to work through them. The shelf count is context only: mention it if it is relevant, ' +
-      'but never push the user to act on ideas - the shelf has no deadlines.',
+      'but never push the user to act on ideas - the shelf has no deadlines. ' +
+      'If what you need is not in this bounded view, try search or get_entity by name before reaching for ' +
+      'all=true - a full dump is the worst case, not the normal path.',
+    inputSchema: {
+      section: SECTION,
+      all: z.boolean().optional().describe(
+        'Bypass the core-only view and return every entity in the section (the old behavior). ' +
+        'Only use this when a scoped search/get_entity genuinely will not do - it can be large.'
+      ),
+    },
+  }, async ({ section, all }) => {
+    return json(db.getLandscape(section, { all: !!all }));
+  });
+
+  guarded('promote_entity', {
+    title: 'Promote entity to core',
+    description:
+      'Move an entity into the "now" working-memory tier (core=1), so it shows up in get_landscape without ' +
+      'a full dump. Use when a topic just became active - e.g. it is what the current conversation is about. ' +
+      'This is deliberate, not automatic: nothing gets promoted just by being touched or created.',
+    inputSchema: {
+      section: SECTION,
+      name: z.string().describe('Entity name to promote, e.g. "Home Network".'),
+    },
+  }, async ({ section, name }) => {
+    const r = db.setEntityCore(section, name, true);
+    if (!r.ok) return text(`No entity named "${name}" in ${section}.`);
+    return text(`"${name}" is now in core (will appear in get_landscape).`);
+  });
+
+  guarded('evict_entity', {
+    title: 'Evict entity from core',
+    description:
+      'Move an entity out of the "now" working-memory tier (core=0), back to the archive, where it is still ' +
+      'fully intact - reachable via search or get_entity by name, just no longer in the default get_landscape ' +
+      'view. Use when a topic is no longer active.',
+    inputSchema: {
+      section: SECTION,
+      name: z.string().describe('Entity name to evict, e.g. "Home Network".'),
+    },
+  }, async ({ section, name }) => {
+    const r = db.setEntityCore(section, name, false);
+    if (!r.ok) return text(`No entity named "${name}" in ${section}.`);
+    return text(`"${name}" evicted from core (still intact, reachable via search/get_entity).`);
+  });
+
+  guarded('list_entities', {
+    title: 'List all entities',
+    description:
+      'Enumerate every entity in a section (own + shared merged), regardless of core/archived status - ' +
+      'name, summary, core flag, updated_at, and observation_count only, never observation bodies. This is ' +
+      'the lightweight full-coverage tool: get_landscape only shows core by default (and all=true drags every ' +
+      'observation along); search is keyword and does not guarantee full coverage; get_entity is one topic in ' +
+      'full. Use this for a browse/audit pass over everything, then get_entity on whichever ones actually need ' +
+      'a closer look.',
     inputSchema: { section: SECTION },
   }, async ({ section }) => {
-    return json(db.getLandscape(section));
+    return json(db.listEntities(section));
   });
 
   guarded('get_entity', {
@@ -157,7 +211,11 @@ function registerTools(server, auth) {
   guarded('upsert_entity', {
     title: 'Create or update entity',
     description:
-      'Create a new topic/project, or update its one-line summary. Does not touch its observations.',
+      'Create a new topic/project, or update its one-line summary. Does not touch its observations. ' +
+      'Search-gated: creating a brand-new name that is a known alias (merged away by merge_entity) redirects ' +
+      'silently to the surviving entity (result carries "redirected"); creating one that is merely similar to ' +
+      'an existing name still succeeds but the result carries "similar_entities" - check it before assuming ' +
+      'this is really new, consider merge_entity if it turns out to be the same topic.',
     inputSchema: {
       section: SECTION,
       name: z.string().describe('Entity name.'),
@@ -165,6 +223,26 @@ function registerTools(server, auth) {
     },
   }, async ({ section, name, summary }) => {
     return json(db.upsertEntity(section, name, summary));
+  });
+
+  guarded('merge_entity', {
+    title: 'Merge entity',
+    description:
+      'Merge one entity into another - the operational half of duplicate cleanup. Copies every observation ' +
+      'from "from" into "into" (unprotected ones get a \'MERGED IN from X\' prefix; protected ones move over ' +
+      'as-is, keeping their protection and original id), records "from" as a permanent alias for "into" (so ' +
+      'add_observation/upsert_entity recreating that name redirects here automatically from then on), then ' +
+      'deletes the now-empty "from" entity. Use only after pulling get_entity on both and confirming this is a ' +
+      'real duplicate, not a related-but-distinct topic - merging those is worse than leaving them separate.',
+    inputSchema: {
+      section: SECTION,
+      from: z.string().describe('The duplicate entity name to merge away.'),
+      into: z.string().describe('The surviving entity name to merge into.'),
+    },
+  }, async ({ section, from, into }) => {
+    const r = db.mergeEntity(section, from, into);
+    if (!r.ok) return text(`Merge failed: ${r.reason}.`);
+    return text(`Merged "${from}" into "${into}" (${r.moved} observation(s) moved/copied). "${from}" is now a permanent alias - recreating it will redirect here.`);
   });
 
   guarded('remove_entity', {
@@ -187,7 +265,9 @@ function registerTools(server, auth) {
     title: 'Add observation',
     description:
       'Add a fact to a topic/project. Creates the entity if it does not exist yet. ' +
-      'Use this to record current state, e.g. "deployed on port 7782" or "waiting on vendor callback".',
+      'Use this to record current state, e.g. "deployed on port 7782" or "waiting on vendor callback". ' +
+      'Search-gated on creation same as upsert_entity: a known-alias name redirects silently ("redirected" in ' +
+      'the result); a merely-similar new name still succeeds but carries "similar_entities" - check it.',
     inputSchema: {
       section: SECTION,
       entity: z.string().describe('Entity name this observation belongs to.'),
